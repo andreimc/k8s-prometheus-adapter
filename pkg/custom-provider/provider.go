@@ -46,22 +46,16 @@ type prometheusProvider struct {
 	promClient prom.Client
 
 	SeriesRegistry
-
-	rateInterval time.Duration
 }
 
-func NewPrometheusProvider(mapper apimeta.RESTMapper, kubeClient dynamic.ClientPool, promClient prom.Client, labelPrefix string, updateInterval time.Duration, rateInterval time.Duration, stopChan <-chan struct{}) provider.CustomMetricsProvider {
+func NewPrometheusProvider(mapper apimeta.RESTMapper, kubeClient dynamic.ClientPool, promClient prom.Client, namers []MetricNamer, updateInterval time.Duration, stopChan <-chan struct{}) provider.CustomMetricsProvider {
 	lister := &cachingMetricsLister{
 		updateInterval: updateInterval,
 		promClient:     promClient,
+		namers:         namers,
 
 		SeriesRegistry: &basicSeriesRegistry{
-			namer: metricNamer{
-				// TODO: populate the overrides list
-				overrides:   nil,
-				mapper:      mapper,
-				labelPrefix: labelPrefix,
-			},
+			mapper: mapper,
 		},
 	}
 
@@ -73,8 +67,6 @@ func NewPrometheusProvider(mapper apimeta.RESTMapper, kubeClient dynamic.ClientP
 		promClient: promClient,
 
 		SeriesRegistry: lister,
-
-		rateInterval: rateInterval,
 	}
 }
 
@@ -132,29 +124,13 @@ func (p *prometheusProvider) metricsFor(valueSet pmodel.Vector, info provider.Me
 }
 
 func (p *prometheusProvider) buildQuery(info provider.MetricInfo, namespace string, names ...string) (pmodel.Vector, error) {
-	kind, baseQuery, groupBy, found := p.QueryForMetric(info, namespace, names...)
+	query, found := p.QueryForMetric(info, namespace, names...)
 	if !found {
 		return nil, provider.NewMetricNotFoundError(info.GroupResource, info.Metric)
 	}
 
-	fullQuery := baseQuery
-	switch kind {
-	case CounterSeries:
-		fullQuery = prom.Selector(fmt.Sprintf("rate(%s[%s])", baseQuery, pmodel.Duration(p.rateInterval).String()))
-	case SecondsCounterSeries:
-		// TODO: futher modify for seconds?
-		fullQuery = prom.Selector(prom.Selector(fmt.Sprintf("rate(%s[%s])", baseQuery, pmodel.Duration(p.rateInterval).String())))
-	}
-
-	// NB: too small of a rate interval will return no results...
-
-	// sum over all other dimensions of this query (e.g. if we select on route, sum across all pods,
-	// but if we select on pods, sum across all routes), and split by the dimension of our resource
-	// TODO: return/populate the by list in SeriesForMetric
-	fullQuery = prom.Selector(fmt.Sprintf("sum(%s) by (%s)", fullQuery, groupBy))
-
 	// TODO: use an actual context
-	queryResults, err := p.promClient.Query(context.Background(), pmodel.Now(), fullQuery)
+	queryResults, err := p.promClient.Query(context.TODO(), pmodel.Now(), query)
 	if err != nil {
 		glog.Errorf("unable to fetch metrics from prometheus: %v", err)
 		// don't leak implementation details to the user
@@ -285,6 +261,7 @@ type cachingMetricsLister struct {
 
 	promClient     prom.Client
 	updateInterval time.Duration
+	namers         []MetricNamer
 }
 
 func (l *cachingMetricsLister) Run() {
@@ -302,17 +279,19 @@ func (l *cachingMetricsLister) RunUntil(stopChan <-chan struct{}) {
 func (l *cachingMetricsLister) updateMetrics() error {
 	startTime := pmodel.Now().Add(-1 * l.updateInterval)
 
-	sels := l.Selectors()
-
-	// TODO: use an actual context here
-	series, err := l.promClient.Series(context.Background(), pmodel.Interval{startTime, 0}, sels...)
-	if err != nil {
-		return fmt.Errorf("unable to update list of all available metrics: %v", err)
+	newSeries := make([][]prom.Series, len(l.namers))
+	for i, namer := range l.namers {
+		// TODO: use an actual context here
+		series, err := l.promClient.Series(context.TODO(), pmodel.Interval{startTime, 0}, namer.Selector())
+		if err != nil {
+			return fmt.Errorf("unable to update list of all available metrics: %v", err)
+		}
+		newSeries[i] = series
 	}
 
-	glog.V(10).Infof("Set available metric list from Prometheus to: %v", series)
+	glog.V(10).Infof("Set available metric list from Prometheus to: %v", newSeries)
 
-	l.SetSeries(series)
+	l.SetSeries(newSeries, l.namers)
 
 	return nil
 }
